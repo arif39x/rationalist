@@ -9,7 +9,10 @@ In Rationalist, there are no polygons or pre-built models. Everything—the grou
 1. **Install the basics**: You'll need Go, Rust, and Python 3.11+.
 2. **Setup**:
    ```bash
-   cd MathCompiler && pip install fastapi uvicorn sympy
+   cd MathCompiler && python3 -m venv venv && source venv/bin/activate && pip install fastapi uvicorn pytest
+   ```
+   ```
+   cd ..
    ```
 3. **Run**:
    ```bash

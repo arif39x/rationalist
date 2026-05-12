@@ -100,10 +100,8 @@ ui.separator();
             ui.vertical_centered(|ui| {
                 ui.add_space(5.0);
                 ui.label(
-                    RichText::new("Rationalist").strong().size(18.0
-                        .strong()
-                        .size(18.0)
-                        TE));,
+                    RichText::new("Rationalist").strong().size(18.0)
+                );
                 
                 ui.add_space(5.0);
             });

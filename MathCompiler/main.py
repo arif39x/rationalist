@@ -1,40 +1,37 @@
-import re
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import sympy as sp
-from ast_firewall import validate_equation
+from core.parser.lower_to_ir import parse_string_to_ir
+from core.runtime.validation import validate_expr
+from core.compiler.optimizer.passes import optimize
+from core.compiler.optimizer.canonicalize import canonicalize
+from core.compiler.type_checker import infer_type
+from core.analysis.complexity import analyze_complexity
+from core.compiler.wgsl.backend import WGSLBackend
+from core.compiler.pass_manager import PassManager
 
 app = FastAPI()
 
 class EquationRequest(BaseModel):
     equation: str
 
-x, y, z = sp.symbols('x y z', real=True)
-state_x, state_y, state_z = sp.symbols('state_x state_y state_z', real=True)
+# Initialize the compiler pipeline
+pm = PassManager()
+pm.add_pass("Type Inference", infer_type)
+pm.add_pass("Semantic Validation", validate_expr)
+pm.add_pass("Canonicalization", canonicalize)
+pm.add_pass("Optimization", optimize)
+pm.add_pass("Complexity Analysis", analyze_complexity)
 
-ALLOWED_VARS = {"x": x, "y": y, "z": z, "state_x": state_x, "state_y": state_y, "state_z": state_z}
+backend = WGSLBackend()
 
-def to_wgsl_module(expr) -> str:
-    c_code = sp.ccode(expr)
-    c_code = re.sub(r'(?<![a-zA-Z0-9_\.])(\d+)(?![a-zA-Z0-9_\.])', r'\1.0', c_code)
-    c_code = c_code.replace('state_x', 'state.x')
-    c_code = c_code.replace('state_y', 'state.y')
-    c_code = c_code.replace('state_z', 'state.z')
-
+def to_wgsl_module(wgsl_expr: str) -> str:
+    # This wraps the generated expression into the full shader template
     return f"""
 struct State {{
     x: f32,
     y: f32,
     z: f32,
     padding: f32,
-}}
-
-struct Emitter {{
-    x: f32,
-    y: f32,
-    z: f32,
-    amplitude: f32,
-    sigma: f32,
 }}
 
 @group(0) @binding(0)
@@ -55,76 +52,91 @@ fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {{
     return out;
 }}
 
+fn opU(d1: vec2<f32>, d2: vec2<f32>) -> vec2<f32> {{
+    if (d1.x < d2.x) {{ return d1; }}
+    return d2;
+}}
+
+// Safe power function to prevent NaN on negative bases (common in SDFs)
+fn safe_pow(base: f32, exp: f32) -> f32 {{
+    return pow(abs(base), exp);
+}}
+
 fn map(p: vec3<f32>) -> vec2<f32> {{
     let x = p.x;
     let y = p.y;
     let z = p.z;
-    let dist = {c_code};
+    
+    // The compiled expression is injected here (replacing pow with safe_pow)
+    let dist = {wgsl_expr.replace("pow(", "safe_pow(")};
+    
     return vec2<f32>(dist, 1.0); // 1.0 = Default Material
 }}
 
-fn get_force_intensity(p: vec3<f32>) -> f32 {{
-    let emitter_pos = vec3<f32>(0.0, 0.0, -20.0);
-    let dist = length(p - emitter_pos);
-    let sigma = 50.0;
-    return exp(-pow(dist, 2.0) / (2.0 * pow(sigma, 2.0)));
+fn calcNormal(p: vec3<f32>) -> vec3<f32> {{
+    let e = vec2<f32>(0.001, 0.0);
+    return normalize(vec3<f32>(
+        map(p + e.xyy).x - map(p - e.xyy).x,
+        map(p + e.yxy).x - map(p - e.yxy).x,
+        map(p + e.yyx).x - map(p - e.yyx).x
+    ));
 }}
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {{
     let uv = in.uv * 2.0 - 1.0;
 
-    let ro = vec3<f32>(0.0, 0.0, 200.0);
-    let rd = normalize(vec3<f32>(uv.x, uv.y, -1.0));
+    // Use state for camera or object offset
+    let ro = vec3<f32>(state.x, state.y, state.z + 100.0);
+    let rd = normalize(vec3<f32>(uv.x, uv.y, -1.5));
 
     var t = 0.0;
-    var force_acc = 0.0;
-
-    for (var i = 0; i < 64; i = i + 1) {{
+    for (var i = 0; i < 128; i = i + 1) {{
         let p = ro + rd * t;
         let res = map(p);
         let d = res.x;
-        let mat = res.y;
-
-        force_acc += get_force_intensity(p) * 0.05;
 
         if (d < 0.001) {{
-            var col = vec3<f32>(0.5, 0.8, 1.0);
-            if (mat > 1.5) {{ // Example for other materials
-                col = vec3<f32>(1.0, 0.5, 0.2);
-            }}
-
-            col = col * (1.0 - f32(i)/64.0);
-            let force_glow = vec3<f32>(0.2, 0.4, 1.0) * force_acc;
-            return vec4<f32>(col + force_glow, 1.0);
+            let n = calcNormal(p);
+            let lightDir = normalize(vec3<f32>(1.0, 1.0, 1.0));
+            let diff = max(dot(n, lightDir), 0.1);
+            
+            var col = vec3<f32>(0.5, 0.7, 1.0) * diff;
+            
+            // Fog / Depth darkening
+            col = col * exp(-0.005 * t);
+            
+            return vec4<f32>(col, 1.0);
         }}
         t = t + d;
-        if (t > 400.0) {{
+        if (t > 500.0) {{
             break;
         }}
     }}
 
-    let field_col = vec3<f32>(0.0, 0.05, 0.1) * force_acc;
-    return vec4<f32>(field_col, 1.0);
+    // Sky gradient
+    let sky = mix(vec3<f32>(0.02, 0.05, 0.1), vec3<f32>(0.1, 0.2, 0.3), uv.y * 0.5 + 0.5);
+    return vec4<f32>(sky, 1.0);
 }}
 """
+
 @app.post("/compile_sdf")
 async def compile_sdf(req: EquationRequest):
     try:
-        validate_equation(req.equation)
-        eq_str = req.equation.replace('state.x', 'state_x').replace('state.y', 'state_y').replace('state.z', 'state_z')
-        expr = sp.sympify(eq_str, locals=ALLOWED_VARS)
+        # 1. Parsing
+        ir_expr = parse_string_to_ir(req.equation)
+        
+        # 2. Run Compiler Pipeline (Type Check, Validate, Optimize)
+        final_ir = pm.run(ir_expr)
+        
+        # 3. Lowering to WGSL AST and Emission
+        wgsl_ast = backend.compile_expr(final_ir)
+        wgsl_expr_string = wgsl_ast.emit()
+        
+        # 4. Wrap into full module
+        full_code = to_wgsl_module(wgsl_expr_string)
 
-        free_symbols = expr.free_symbols
-        allowed_set = set(ALLOWED_VARS.values())
-        if not free_symbols.issubset(allowed_set):
-            unauthorized = free_symbols - allowed_set
-            raise HTTPException(status_code=400, detail=f"Unauthorized variables used: {unauthorized}")
-
-        wgsl_code = to_wgsl_module(expr)
-
-        return {"status": "success", "wgsl": wgsl_code}
-
+        return {"status": "success", "wgsl": full_code}
         
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Compilation error: {str(e)}")

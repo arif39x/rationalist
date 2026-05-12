@@ -14,7 +14,7 @@ sleep 1
 
 echo "Booting GameServer (Go)..."
 cd GameServer
-go run main.go &
+go run . &
 PID_SERVER=$!
 cd ..
 
